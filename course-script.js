@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         绕过课程多标签页限制
+// @name         绕过课程多标签页和自动暂停限制 (自动1.5倍速)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  防止在打开多个标签页时课程页面关闭或重定向。
+// @version      1.1
+// @description  阻止多标签页检测重定向，禁用鼠标静止和试看时长导致的自动暂停，并自动设置为1.5倍速播放。
 // @author       [您的名字]
 // @match        *://wangda.chinamobile.com/*
 // @grant        none
@@ -11,32 +11,28 @@
 
 (function() {
     'use strict';
+
     console.debug = () => {}
+    console.log = () => {}
     console.dir = () => {}
     console.info = () => {}
     console.table = () => {}
     console.clear = () => {}
-    console.log = () => {}
 
     // 存储原始的 loadjs.d 方法
     const originalLoadjsD = window.loadjs.d;
 
     // 覆盖 loadjs.d 方法，以便在模块被定义时进行拦截和修改
     window.loadjs.d = function(moduleName, factory, deps) {
+        // 拦截 player-helper 模块
         if (moduleName === "./app/study/course/detail/player-helper") {
             console.warn("拦截到 player-helper 模块定义，准备覆盖 multipleClientStudy。");
             return originalLoadjsD(moduleName, function(e, n, a) {
-                // 执行原始的 factory 函数来获取原始模块的 exports
                 factory(e, n, a);
-
-                // 获取原始的 player-helper 内部对象 (这里假设它会暴露给外部，通常在 CommonJS 模块中 via n.exports)
                 const originalPlayerHelper = n.exports;
-
-                // 覆盖 originalPlayerHelper 中的 multipleClientStudy 方法
                 if (originalPlayerHelper && originalPlayerHelper.WS && originalPlayerHelper.WS.multipleClientStudy) {
                     originalPlayerHelper.WS.multipleClientStudy = function() {
                         console.warn("player-helper.WS.multipleClientStudy 被调用，但已阻止其默认行为。");
-                        // 阻止其重定向和发送消息，只打印日志
                     };
                     console.warn("成功覆盖 player-helper.WS.multipleClientStudy。");
                 } else {
@@ -44,19 +40,159 @@
                 }
             }, deps);
         }
+        // 拦截 video/view-video 模块
+        else if (moduleName === "./app/study/course/detail/player/video/view-video") {
+            console.warn("拦截到 video/view-video 模块定义，准备禁用自动暂停逻辑和设置倍速。");
+            return originalLoadjsD(moduleName, function(e, n, a) {
+                factory(e, n, a);
+                const originalViewVideo = n.exports;
+
+                if (originalViewVideo && originalViewVideo.mixin) {
+                    // 覆盖 checkMouseStayTime 方法使其不执行任何操作
+                    originalViewVideo.mixin.checkMouseStayTime = function() {
+                        console.warn("阻止了 checkMouseStayTime 鼠标静止检测。");
+                        this.module.dispatch("clearMouseStatyTime");
+                        this.module.dispatch("stopRecordLearnTime");
+                    };
+
+                    // 覆盖 video 对象中的 timeupdate 和 canplay 逻辑
+                    if (originalViewVideo.video) {
+                        // 移除 timeupdate 中的试看暂停逻辑
+                        const originalTimeupdate = originalViewVideo.video.timeupdate;
+                        originalViewVideo.video.timeupdate = function(e) {
+                            const n = this.bindings.state.data;
+                            const a = Math.floor(e.currentTime());
+                            // 移除原有的试看暂停代码
+                            this.app.askbar.trigger("study.video.playTimeChange", a, e.duration());
+                        };
+
+                        // 在 canplay 事件中设置播放速度
+                        const originalCanplay = originalViewVideo.video.canplay;
+                        originalViewVideo.video.canplay = function(e) {
+                            console.warn("视频 ready，尝试设置为 1.5 倍速。");
+                            const player = this.components.player; // 获取 Video.js 播放器实例
+                            if (player && typeof player.playbackRate === 'function') {
+                                player.playbackRate(1.5); // 设置为 1.5 倍速
+                                console.warn("视频播放速度已设置为: 1.5x");
+                            } else {
+                                console.warn("Video.js 播放器实例未找到或 playbackRate 方法不可用。");
+                            }
+                            // 调用原始的 canplay 逻辑
+                            originalCanplay.call(this, e);
+                        };
+
+                        // 移除 playing 中的 checkMouseStayTime 调用
+                        const originalPlaying = originalViewVideo.video.playing;
+                        originalViewVideo.video.playing = function(e) {
+                            const n = this;
+                            const a = !!Number(n.bindings.ruleConfigRate.data.value);
+                            const t = !!Number(n.module.renderOptions.useVideoSpeed);
+                            const l = localStorage.getItem("cache-doubling-speed");
+                            const i = this.bindings.playStamp.data.time;
+                            const s = Date.now();
+                            if (a && t && l) {
+                                e.playbackRate(l);
+                                // m = l; // 这行代码在原脚本中，保留或移除取决于是否影响其他地方
+                            }
+                            this.initTimeFn(e);
+                            if (s - i < 1e3) { // 这段条件判断是原脚本中就有的
+                                this.module.renderOptions.recordLearnTime();
+                                // 移除原有的 this.module.renderOptions.checkMouseStayTime() 调用
+                                // this.module.renderOptions.checkMouseStayTime(); // 已禁用
+                                this.module.dispatch("changePlayStamp", s);
+                            }
+                            originalPlaying.call(this, e); // 调用原始的 playing 逻辑
+                        };
+
+                    }
+                    console.warn("成功覆盖 video/view-video 中的自动暂停逻辑和设置倍速。");
+                } else {
+                    console.warn("未能在 video/view-video 中找到或覆盖 mixin/video 对象。");
+                }
+            }, deps);
+        }
+        // 拦截 audio-new/view-video 模块
+        else if (moduleName === "./app/study/course/detail/player/audio-new/view-video") {
+            console.warn("拦截到 audio-new/view-video 模块定义，准备禁用自动暂停逻辑和设置倍速。");
+            return originalLoadjsD(moduleName, function(e, n, a) {
+                factory(e, n, a);
+                const originalViewAudio = n.exports;
+
+                if (originalViewAudio && originalViewAudio.mixin) {
+                    // 覆盖 checkMouseStayTime 方法使其不执行任何操作
+                    originalViewAudio.mixin.checkMouseStayTime = function() {
+                        console.warn("阻止了 audio-new/view-video 中的 checkMouseStayTime 鼠标静止检测。");
+                        this.module.dispatch("clearMouseStatyTime");
+                        this.module.dispatch("stopRecordLearnTime");
+                    };
+
+                    // 覆盖 video (实际上是 audio) 对象中的 timeupdate 和 canplay 逻辑
+                    if (originalViewAudio.video) {
+                        // 移除 timeupdate 中的试看暂停逻辑
+                        const originalAudioTimeupdate = originalViewAudio.video.timeupdate;
+                        originalViewAudio.video.timeupdate = function(e) {
+                            const n = this.bindings.state.data;
+                            const a = Math.floor(e.currentTime());
+                            // 移除原有的试看暂停代码
+                            this.app.askbar.trigger("study.video.playTimeChange", a, e.duration());
+                        };
+
+                        // 在 canplay 事件中设置播放速度
+                        const originalAudioCanplay = originalViewAudio.video.canplay;
+                        originalViewAudio.video.canplay = function(e) {
+                            console.warn("音频 ready，尝试设置为 1.5 倍速。");
+                            const player = this.components.player; // 获取 Video.js 播放器实例
+                            if (player && typeof player.playbackRate === 'function') {
+                                player.playbackRate(1.5); // 设置为 1.5 倍速
+                                console.warn("音频播放速度已设置为: 1.5x");
+                            } else {
+                                console.warn("Video.js 播放器实例未找到或 playbackRate 方法不可用。");
+                            }
+                            // 调用原始的 canplay 逻辑
+                            originalAudioCanplay.call(this, e);
+                        };
+
+                         // 移除 playing 中的 checkMouseStayTime 调用
+                        const originalAudioPlaying = originalViewAudio.video.playing;
+                        originalViewAudio.video.playing = function(e) {
+                            const n = this;
+                            const a = !!Number(n.bindings.ruleConfigRate.data.value);
+                            const t = !!Number(n.module.renderOptions.useVideoSpeed);
+                            const l = localStorage.getItem("cache-doubling-speed");
+                            const i = this.bindings.playStamp.data.time;
+                            const s = Date.now();
+                            if (a && t && l) {
+                                e.playbackRate(l);
+                                // m = l; // 这行代码在原脚本中，保留或移除取决于是否影响其他地方
+                            }
+                            this.initTimeFn(e);
+                            if (s - i < 1e3) { // 这段条件判断是原脚本中就有的
+                                this.module.renderOptions.recordLearnTime();
+                                // 移除原有的 this.module.renderOptions.checkMouseStayTime() 调用
+                                // this.module.renderOptions.checkMouseStayTime(); // 已禁用
+                                this.module.dispatch("changePlayStamp", s);
+                            }
+                            originalAudioPlaying.call(this, e); // 调用原始的 playing 逻辑
+                        };
+                    }
+                    console.warn("成功覆盖 audio-new/view-video 中的自动暂停逻辑和设置倍速。");
+                } else {
+                    console.warn("未能在 audio-new/view-video 中找到或覆盖 mixin/video 对象。");
+                }
+            }, deps);
+        }
+
         // 对于其他模块，正常调用原始的 loadjs.d
         return originalLoadjsD.apply(this, arguments);
     };
 
 
-    // --- 策略 1：阻止 window.close() 和 window.location.replace() ---
+    // --- 策略：阻止 window.close() 和 window.location.replace() ---
 
-    // 覆盖 window.close 以不执行任何操作
     window.close = function() {
         console.warn('window.close() 被调用，但被 Tampermonkey 脚本阻止。');
     };
 
-    // 覆盖 window.location.replace
     const originalReplace = window.location.replace;
     try {
         Object.defineProperty(window.location, 'replace', {
@@ -76,7 +212,6 @@
     }
 
     // 捕获并阻止 window.setlocationHref 的调用
-    // 根据JS代码，似乎有一个全局的 window.setlocationHref 函数
     if (window.setlocationHref) {
         const originalSetlocationHref = window.setlocationHref;
         window.setlocationHref = function(url) {
@@ -85,11 +220,10 @@
                 return;
             }
             console.warn('window.setlocationHref() 被调用：', url);
-            originalSetlocationHref.apply(this, arguments); // 如果确实需要允许其他跳转，则保留这行
+            originalSetlocationHref.apply(this, arguments);
         };
         console.warn("成功覆盖 window.setlocationHref。");
     } else {
-        // 如果 setlocationHref 不存在，尝试覆盖原生的 window.location.href setter
         const originalHrefDescriptor = Object.getOwnPropertyDescriptor(Location.prototype, 'href') ||
                                        Object.getOwnPropertyDescriptor(Window.prototype, 'location');
         const originalHrefGetter = originalHrefDescriptor ? originalHrefDescriptor.get : null;
@@ -121,7 +255,7 @@
     }
 
 
-    // --- 策略 2：禁用 BroadcastChannel 相关逻辑 ---
+    // --- 策略：禁用 BroadcastChannel 相关逻辑 ---
     if (window.BroadcastChannel) {
         window.BroadcastChannel = class {
             constructor(channelName) {
@@ -150,7 +284,7 @@
         }
     }
 
-    // --- 策略 3：覆盖 navigator.sendBeacon ---
+    // --- 策略：覆盖 navigator.sendBeacon ---
     const originalSendBeacon = navigator.sendBeacon;
     navigator.sendBeacon = function(url, data) {
         if (url.includes('/course-study/course-front/video-progress-new') ||
@@ -163,7 +297,7 @@
     };
 
 
-    // --- 策略 4：直接禁用 'beforeunload' 事件监听器 ---
+    // --- 策略：直接禁用 'beforeunload' 事件监听器 ---
     const originalAddEventListener = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, listener, options) {
         if (type === 'beforeunload' && listener && listener.toString().includes('flowHandler')) {
@@ -195,5 +329,6 @@
         console.warn('window.onbeforeunload 被阻止。');
     };
 
-    console.warn('绕过课程多标签页限制脚本已激活。');
+    console.warn('绕过课程多标签页和自动暂停限制脚本已激活。');
+
 })();
